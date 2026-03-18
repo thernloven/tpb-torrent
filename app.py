@@ -433,11 +433,13 @@ def monitor_loop():
                     last_activity = time.time()
                     log.info(f'[MONITOR] Local download complete: {info_hash}')
 
-        # Idle shutdown
+        # Idle shutdown — backend handles destruction via DO API
+        # This is just a safety net to stop the service
         if IDLE_SHUTDOWN_MINUTES > 0 and not active_torrents:
             idle_seconds = time.time() - last_activity
             if idle_seconds > IDLE_SHUTDOWN_MINUTES * 60:
-                os.system('shutdown -h now')
+                log.info('[MONITOR] Idle timeout reached, stopping service')
+                os._exit(0)
 
 
 # Start background monitor
