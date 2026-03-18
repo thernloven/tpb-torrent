@@ -1,4 +1,5 @@
 import os
+import logging
 import threading
 import time
 import glob
@@ -13,6 +14,12 @@ from functools import wraps
 app = Flask(__name__)
 CORS(app)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = True
+
+# Logging — ensures output shows in gunicorn error log
+gunicorn_logger = logging.getLogger('gunicorn.error')
+app.logger.handlers = gunicorn_logger.handlers
+app.logger.setLevel(gunicorn_logger.level)
+log = app.logger
 
 # Config
 API_KEY = os.getenv('API_KEY', 'change-me-in-production')
@@ -77,7 +84,9 @@ def search_torrents(term, page=1):
     sort = request.args.get('sort', '')
     sort_code = SORT_FILTERS.get(sort, 99)
     url = f'{BASE_URL}search/{term}/{page}/{sort_code}/0'
+    log.info(f'[SEARCH] "{term}" page={page} sort={sort}')
     results = parse_page(url, sort=sort if sort in SORT_FILTERS else '')
+    log.info(f'[SEARCH] "{term}" → {len(results)} results')
     return jsonify(results), 200
 
 
@@ -178,10 +187,13 @@ def add_torrent():
     if not magnet:
         return jsonify({'error': 'No magnet link provided'}), 400
 
+    log.info(f'[ADD] Adding torrent, content_id={data.get("content_id")}, has_r2_url={bool(data.get("r2_url"))}')
+
     params = lt.parse_magnet_uri(magnet)
     params.save_path = DOWNLOAD_PATH
     handle = ses.add_torrent(params)
     info_hash = str(handle.info_hash())
+    log.info(f'[ADD] Torrent added: hash={info_hash}')
 
     active_torrents[info_hash] = {
         'handle': handle,
@@ -345,6 +357,7 @@ def monitor_loop():
 
             # Check if download is complete
             if s.progress >= 1.0 and s.state in (4, 5):  # finished or seeding
+                log.info(f'[MONITOR] Download complete: {s.name} ({info_hash})')
                 handle.pause()  # stop seeding
 
                 # Find the downloaded file
@@ -356,13 +369,17 @@ def monitor_loop():
                     file_path = find_largest_file(save_path)
 
                 if not file_path or not os.path.exists(file_path):
+                    log.error(f'[MONITOR] File not found after download: {info_hash}')
                     t['status'] = 'error'
                     continue
 
                 r2_url = t.get('r2_url')
                 if r2_url:
                     # Upload to R2
+                    file_size = os.path.getsize(file_path)
+                    log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
                     success = upload_to_r2(file_path, r2_url, info_hash)
+                    log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
                     notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), success)
 
                     if success:
@@ -370,10 +387,12 @@ def monitor_loop():
                         ses.remove_torrent(handle, lt.options_t.delete_files)
                         del active_torrents[info_hash]
                         last_activity = time.time()
+                        log.info(f'[MONITOR] Cleaned up {info_hash}')
                 else:
                     # No R2 URL — just mark as done (local download mode)
                     t['status'] = 'completed'
                     last_activity = time.time()
+                    log.info(f'[MONITOR] Local download complete: {info_hash}')
 
         # Idle shutdown
         if IDLE_SHUTDOWN_MINUTES > 0 and not active_torrents:
