@@ -23,10 +23,10 @@ log = app.logger
 
 # Config
 API_KEY = os.getenv('API_KEY', 'change-me-in-production')
+BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:3000')
 BASE_URL = os.getenv('TPB_URL', 'https://thepiratebay10.info/')
 DOWNLOAD_PATH = os.getenv('DOWNLOAD_PATH', '/tmp/torrents')
 IDLE_SHUTDOWN_MINUTES = int(os.getenv('IDLE_SHUTDOWN_MINUTES', '10'))
-R2_MULTIPART_CHUNK = 100 * 1024 * 1024  # 100MB chunks for R2 upload
 REQUEST_TIMEOUT = 15
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -187,7 +187,7 @@ def add_torrent():
     if not magnet:
         return jsonify({'error': 'No magnet link provided'}), 400
 
-    log.info(f'[ADD] Adding torrent, content_id={data.get("content_id")}, has_r2_url={bool(data.get("r2_url"))}')
+    log.info(f'[ADD] Adding torrent, content_id={data.get("content_id")}, has_r2_key={bool(data.get("r2_key"))}')
 
     params = lt.parse_magnet_uri(magnet)
     params.save_path = DOWNLOAD_PATH
@@ -197,7 +197,7 @@ def add_torrent():
 
     active_torrents[info_hash] = {
         'handle': handle,
-        'r2_url': data.get('r2_url'),
+        'r2_key': data.get('r2_key'),
         'content_id': data.get('content_id'),
         'callback_url': data.get('callback_url'),
         'status': 'downloading',
@@ -295,8 +295,8 @@ def find_largest_file(directory):
     return largest
 
 
-def upload_to_r2(file_path, presigned_url, info_hash):
-    '''Upload a file to R2 using a presigned PUT URL. Streams the file.'''
+def upload_to_r2(file_path, r2_key, info_hash):
+    '''Upload a file to R2 using multipart upload via the backend.'''
     t = active_torrents.get(info_hash)
     if not t:
         return False
@@ -305,37 +305,73 @@ def upload_to_r2(file_path, presigned_url, info_hash):
     t['status'] = 'uploading'
     t['upload_progress'] = 0
 
+    headers = {'X-API-Key': API_KEY, 'Content-Type': 'application/json'}
+
     try:
-        with open(file_path, 'rb') as f:
-            resp = requests.put(
-                presigned_url,
-                data=f,
-                headers={
-                    'Content-Length': str(file_size),
-                    'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
-                },
-                timeout=3600,
-            )
-        if resp.status_code in (200, 201):
-            t['upload_progress'] = 100
-            return True
-        else:
+        # Step 1: Get multipart upload URLs from backend
+        resp = requests.post(f'{BACKEND_URL}/api/torrents/multipart/create', json={
+            'r2_key': r2_key,
+            'file_size': file_size,
+        }, headers=headers, timeout=30)
+
+        if resp.status_code != 200:
+            log.error(f'[UPLOAD] Failed to create multipart: {resp.text}')
             t['status'] = 'upload_failed'
             return False
-    except Exception:
+
+        multipart = resp.json()
+        upload_id = multipart['uploadId']
+        parts = multipart['parts']
+        total_parts = len(parts)
+        log.info(f'[UPLOAD] Multipart created: {total_parts} parts for {file_size} bytes')
+
+        # Step 2: Upload each part
+        with open(file_path, 'rb') as f:
+            for part in parts:
+                chunk = f.read(part['size'])
+                part_resp = requests.put(part['url'], data=chunk, headers={
+                    'Content-Length': str(len(chunk)),
+                }, timeout=600)
+
+                if part_resp.status_code not in (200, 201):
+                    log.error(f'[UPLOAD] Part {part["partNumber"]} failed: {part_resp.status_code}')
+                    t['status'] = 'upload_failed'
+                    return False
+
+                progress = round((part['partNumber'] / total_parts) * 100, 1)
+                t['upload_progress'] = progress
+                log.info(f'[UPLOAD] Part {part["partNumber"]}/{total_parts} done ({progress}%)')
+
+        # Step 3: Complete multipart upload
+        complete_resp = requests.post(f'{BACKEND_URL}/api/torrents/multipart/complete', json={
+            'r2_key': r2_key,
+            'upload_id': upload_id,
+        }, headers=headers, timeout=30)
+
+        if complete_resp.status_code != 200:
+            log.error(f'[UPLOAD] Failed to complete multipart: {complete_resp.text}')
+            t['status'] = 'upload_failed'
+            return False
+
+        t['upload_progress'] = 100
+        log.info(f'[UPLOAD] Multipart upload complete: {r2_key}')
+        return True
+
+    except Exception as e:
+        log.error(f'[UPLOAD] Exception: {e}')
         t['status'] = 'upload_failed'
         return False
 
 
-def notify_callback(callback_url, info_hash, content_id, success):
-    '''Notify the backend that upload is complete.'''
+def notify_callback(callback_url, info_hash, content_id, status):
+    '''Notify the backend of status changes.'''
     if not callback_url:
         return
     try:
         requests.post(callback_url, json={
             'info_hash': info_hash,
             'content_id': content_id,
-            'status': 'uploaded' if success else 'failed',
+            'status': status,
         }, headers={'X-API-Key': API_KEY}, timeout=10)
     except Exception:
         pass
@@ -373,14 +409,17 @@ def monitor_loop():
                     t['status'] = 'error'
                     continue
 
-                r2_url = t.get('r2_url')
-                if r2_url:
-                    # Upload to R2
+                r2_key = t.get('r2_key')
+                if r2_key:
+                    # Notify backend: status → uploading
+                    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploading')
+
+                    # Upload to R2 via multipart
                     file_size = os.path.getsize(file_path)
                     log.info(f'[MONITOR] Uploading to R2: {file_path} ({file_size} bytes)')
-                    success = upload_to_r2(file_path, r2_url, info_hash)
+                    success = upload_to_r2(file_path, r2_key, info_hash)
                     log.info(f'[MONITOR] R2 upload {"success" if success else "FAILED"}: {info_hash}')
-                    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), success)
+                    notify_callback(t.get('callback_url'), info_hash, t.get('content_id'), 'uploaded' if success else 'failed')
 
                     if success:
                         # Clean up: remove torrent + files
