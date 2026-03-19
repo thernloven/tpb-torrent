@@ -439,18 +439,25 @@ def monitor_loop():
             if idle_seconds > IDLE_SHUTDOWN_MINUTES * 60:
                 log.info('[MONITOR] Idle timeout reached, self-destructing droplet...')
                 try:
-                    meta = requests.get('http://169.254.169.254/metadata/v1/id', timeout=5)
-                    droplet_id = meta.text.strip()
                     do_token = os.getenv('DO_API_TOKEN', '')
-                    if do_token and droplet_id:
-                        resp = requests.delete(
-                            f'https://api.digitalocean.com/v2/droplets/{droplet_id}',
+                    if do_token:
+                        # Find our droplet by tag since metadata service is blocked by VPN
+                        resp = requests.get(
+                            'https://api.digitalocean.com/v2/droplets?tag_name=aperture-torrent',
                             headers={'Authorization': f'Bearer {do_token}'},
                             timeout=10,
                         )
-                        log.info(f'[MONITOR] Self-destruct: droplet {droplet_id}, status {resp.status_code}')
+                        droplets = resp.json().get('droplets', [])
+                        for d in droplets:
+                            droplet_id = d['id']
+                            del_resp = requests.delete(
+                                f'https://api.digitalocean.com/v2/droplets/{droplet_id}',
+                                headers={'Authorization': f'Bearer {do_token}'},
+                                timeout=10,
+                            )
+                            log.info(f'[MONITOR] Self-destruct: droplet {droplet_id}, status {del_resp.status_code}')
                     else:
-                        log.error('[MONITOR] Missing DO_API_TOKEN or droplet ID')
+                        log.error('[MONITOR] Missing DO_API_TOKEN')
                 except Exception as e:
                     log.error(f'[MONITOR] Self-destruct failed: {e}')
                 os._exit(0)
